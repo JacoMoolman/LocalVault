@@ -1,0 +1,45 @@
+[package]
+name = "localvault"
+version = "1.0.0"
+edition = "2024"
+description = "A local, offline password vault for Windows with Windows Hello unlock"
+publish = false
+
+[dependencies]
+arboard = "3.7.0"
+argon2 = "0.6.0"
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+eframe = "0.37.0"
+getrandom = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+windows = { version = "0.62.2", features = [
+    "Security_Credentials",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Foundation",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_WindowsAndMessaging",
+] }
+zeroize = { version = "1.9.1", features = ["derive"] }
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["wgpu", "snapshot", "eframe"] }
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Argon2 is unusably slow without optimisation, even in debug builds and tests.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

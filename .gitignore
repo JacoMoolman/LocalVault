@@ -1,0 +1,14 @@
+# Build output
+/target
+/target-*/
+
+# Local vaults and anything next to the exe. Never commit a vault.
+/dist/
+*.vault
+*.vault.bak
+*.bak
+*.tmp
+
+# egui_kittest snapshot diffs
+**/tests/snapshots/**/*.diff.png
+**/tests/snapshots/**/*.new.png
