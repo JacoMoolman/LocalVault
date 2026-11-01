@@ -18,6 +18,7 @@ use crate::vault::{Entry, Field, UnlockedVault, VaultFile, unix_now};
 use crate::{CLIPBOARD_CLEAR_SECONDS, IDLE_CLOSE_SECONDS, MIN_MASTER_PASSWORD_LEN, hello, window};
 
 const MASK: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+const MIN_BACKUP_PASSWORD_LEN: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Background work
@@ -29,6 +30,7 @@ enum Job {
     Opened { result: Result<UnlockedVault, String>, is_new: bool },
     HelloEnabled { name: String, challenge: Vec<u8>, result: Result<Zeroizing<Vec<u8>>, String> },
     PasswordKeys(Result<(SecretKey, Vec<u8>, SecretKey), String>),
+    BackupKey(Result<(Vec<u8>, SecretKey), String>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -36,6 +38,7 @@ enum Busy {
     Opening,
     HelloSetup,
     PasswordChange,
+    BackupChange,
 }
 
 struct Toast {
@@ -138,6 +141,7 @@ struct LockScreen {
     password: Zeroizing<String>,
     error: Option<String>,
     has_hello: bool,
+    has_backup: bool,
     focused: bool,
 }
 
@@ -161,6 +165,9 @@ struct SettingsForm {
     new: Zeroizing<String>,
     confirm: Zeroizing<String>,
     message: Option<(String, bool)>,
+    backup: Zeroizing<String>,
+    backup_confirm: Zeroizing<String>,
+    backup_message: Option<(String, bool)>,
 }
 
 struct Session {
@@ -224,7 +231,10 @@ impl App {
         }
         let mut lock = LockScreen::default();
         match VaultFile::load(path) {
-            Ok(file) => lock.has_hello = file.hello_slot.is_some(),
+            Ok(file) => {
+                lock.has_hello = file.hello_slot.is_some();
+                lock.has_backup = file.backup_slot.is_some();
+            }
             Err(e) => lock.error = Some(e.to_string()),
         }
         Screen::Locked(lock)
@@ -239,15 +249,21 @@ impl App {
                     match result {
                         Ok(vault) => {
                             let offer_hello = is_new && self.s.hello_supported == Some(true);
+                            // After a forgotten password, go straight to choosing a new one.
+                            let forgot = vault.opened_with_backup;
+                            let mut settings = SettingsForm::default();
+                            if forgot {
+                                settings.message = Some(("You used your backup password. Choose a new master password.".into(), true));
+                            }
                             self.screen = Screen::Unlocked(Box::new(Session {
                                 vault,
                                 selected: None,
                                 search: String::new(),
                                 revealed: HashSet::new(),
                                 draft: None,
-                                dialog: Dialog::None,
+                                dialog: if forgot { Dialog::Settings } else { Dialog::None },
                                 offer_hello,
-                                settings: SettingsForm::default(),
+                                settings,
                             }));
                             if is_new {
                                 self.s.toast("Your vault is ready.", OK);
@@ -284,7 +300,7 @@ impl App {
                         let form = &mut session.settings;
                         match result {
                             Ok((current_kek, new_salt, new_kek)) => {
-                                if !session.vault.password_key_matches(&current_kek) {
+                                if !session.vault.opened_with_backup && !session.vault.password_key_matches(&current_kek) {
                                     form.message = Some(("Your current master password is not correct.".into(), false));
                                 } else {
                                     match session.vault.set_password_key(new_salt, KdfParams::STRONG, &new_kek) {
@@ -298,6 +314,19 @@ impl App {
                             }
                             Err(e) => form.message = Some((e, false)),
                         }
+                    }
+                }
+                Job::BackupKey(result) => {
+                    self.s.busy = None;
+                    if let Screen::Unlocked(session) = &mut self.screen {
+                        let form = &mut session.settings;
+                        let saved = result.and_then(|(salt, kek)| session.vault.set_backup_key(salt, KdfParams::STRONG, &kek).map_err(|e| e.to_string()));
+                        form.backup.zeroize();
+                        form.backup_confirm.zeroize();
+                        form.backup_message = Some(match saved {
+                            Ok(()) => ("Backup password saved.".into(), true),
+                            Err(e) => (e, false),
+                        });
                     }
                 }
             }
@@ -464,7 +493,7 @@ fn setup_ui(ui: &mut egui::Ui, ctx: &egui::Context, st: &mut SetupScreen, s: &mu
             ui.label(RichText::new("Create your vault").font(theme::strong(theme::SIZE_DISPLAY)).color(TEXT));
             ui.add_space(2.0);
             ui.label(
-                RichText::new("Choose a master password. It encrypts everything you store here, on this PC only. Nobody can reset it, so keep it somewhere safe.")
+                RichText::new("Choose a master password. It encrypts everything you store here, on this PC only. Nobody can reset it, so add a backup password in Settings afterwards.")
                     .size(theme::SIZE_BODY)
                     .color(MUTED),
             );
@@ -526,6 +555,9 @@ fn lock_ui(ui: &mut egui::Ui, ctx: &egui::Context, l: &mut LockScreen, s: &mut S
                 "Enter your master password to unlock."
             };
             ui.label(RichText::new(prompt).size(theme::SIZE_BODY).color(MUTED));
+            if l.has_backup {
+                ui.label(RichText::new("Forgot it? Type your backup password here instead.").size(theme::SIZE_BODY).color(MUTED));
+            }
             ui.add_space(18.0);
 
             let busy = s.busy.is_some();
@@ -1183,11 +1215,14 @@ fn settings_body(ui: &mut egui::Ui, ctx: &egui::Context, session: &mut Session, 
     ui.label(RichText::new("Master password").font(theme::strong(15.5)).color(TEXT));
     ui.add_space(4.0);
     let busy_pw = s.busy == Some(Busy::PasswordChange);
+    let forgot = session.vault.opened_with_backup;
     let form = &mut session.settings;
     ui.add_enabled_ui(s.busy.is_none(), |ui| {
-        let lid = ui.label(theme::label("Current master password")).id;
-        password_field(ui, &mut form.current, lid);
-        ui.add_space(4.0);
+        if !forgot {
+            let lid = ui.label(theme::label("Current master password")).id;
+            password_field(ui, &mut form.current, lid);
+            ui.add_space(4.0);
+        }
         let lid = ui.label(theme::label("New master password")).id;
         password_field(ui, &mut form.new, lid);
         ui.add_space(2.0);
@@ -1219,6 +1254,69 @@ fn settings_body(ui: &mut egui::Ui, ctx: &egui::Context, session: &mut Session, 
         }
     });
     if let Some((msg, ok)) = &form.message {
+        ui.add_space(4.0);
+        ui.label(RichText::new(msg).size(theme::SIZE_SMALL + 0.5).color(if *ok { OK } else { DANGER }));
+    }
+
+    ui.add_space(16.0);
+    rule(ui);
+    ui.add_space(14.0);
+
+    // Backup password
+    ui.label(RichText::new("Backup password").font(theme::strong(15.5)).color(TEXT));
+    let has_backup = session.vault.has_backup();
+    let status = if has_backup {
+        "On. It opens this vault if the master password is forgotten. Anyone who knows it can open the vault, so make it long and keep it somewhere safe."
+    } else {
+        "Off. Add one so the vault can still be opened if the master password is forgotten."
+    };
+    ui.label(RichText::new(status).size(theme::SIZE_BODY).color(MUTED));
+    ui.add_space(6.0);
+    let busy_backup = s.busy == Some(Busy::BackupChange);
+    let mut start_backup = None;
+    let mut remove_backup = false;
+    let form = &mut session.settings;
+    ui.add_enabled_ui(s.busy.is_none(), |ui| {
+        let lid = ui.label(theme::label("New backup password")).id;
+        password_field(ui, &mut form.backup, lid);
+        ui.add_space(4.0);
+        let lid = ui.label(theme::label("Type the backup password again")).id;
+        password_field(ui, &mut form.backup_confirm, lid);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let label = if busy_backup { "Saving\u{2026}" } else { "Save backup password" };
+            if ui.add(theme::secondary(label)).clicked() {
+                if form.backup.chars().count() < MIN_BACKUP_PASSWORD_LEN {
+                    form.backup_message = Some((format!("Use at least {MIN_BACKUP_PASSWORD_LEN} characters for your backup password."), false));
+                } else if *form.backup != *form.backup_confirm {
+                    form.backup_message = Some(("The backup passwords do not match.".into(), false));
+                } else {
+                    form.backup_message = None;
+                    start_backup = Some(Zeroizing::new(form.backup.to_string()));
+                }
+            }
+            if has_backup && ui.add(theme::secondary("Remove backup password")).clicked() {
+                remove_backup = true;
+            }
+        });
+    });
+    if let Some(backup) = start_backup {
+        s.start(ctx, Busy::BackupChange, move || {
+            let result = (|| {
+                let salt = crypto::random_bytes::<SALT_LEN>().map_err(|e| e.to_string())?.to_vec();
+                let kek = crypto::derive_key(backup.as_bytes(), &salt, KdfParams::STRONG).map_err(|e| e.to_string())?;
+                Ok((salt, kek))
+            })();
+            Job::BackupKey(result)
+        });
+    }
+    if remove_backup {
+        session.settings.backup_message = Some(match session.vault.remove_backup() {
+            Ok(()) => ("Backup password removed.".into(), true),
+            Err(e) => (e.to_string(), false),
+        });
+    }
+    if let Some((msg, ok)) = &session.settings.backup_message {
         ui.add_space(4.0);
         ui.label(RichText::new(msg).size(theme::SIZE_SMALL + 0.5).color(if *ok { OK } else { DANGER }));
     }
@@ -1394,6 +1492,42 @@ mod ui_tests {
         for secret in ["Example Bank", "jake@example.com", "4821", generated.as_str()] {
             assert!(!raw.contains(secret), "{secret} found in the vault file");
         }
+    }
+
+    #[test]
+    fn forgotten_master_password_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("LocalVault.vault");
+        let mut h = harness(path.clone());
+        settle(&mut h);
+        type_into(&mut h, "Master password", TEST_PASSWORD);
+        type_into(&mut h, "Type it again", TEST_PASSWORD);
+        click(&mut h, "Create vault");
+        wait(&mut h, "vault creation", |a| matches!(a.screen, Screen::Unlocked(_)));
+        if h.query_by_label("Not now").is_some() {
+            click(&mut h, "Not now");
+        }
+
+        click(&mut h, "Settings");
+        type_into(&mut h, "New backup password", "Backup-Pass-1");
+        type_into(&mut h, "Type the backup password again", "Backup-Pass-1");
+        click(&mut h, "Save backup password");
+        wait(&mut h, "backup saved", |a| a.s.busy.is_none() && session(a).vault.has_backup());
+        click(&mut h, "Done");
+        click(&mut h, "Lock");
+
+        type_into(&mut h, "Master password", "Backup-Pass-1");
+        click(&mut h, "Unlock");
+        wait(&mut h, "backup unlock", |a| matches!(a.screen, Screen::Unlocked(_)));
+        assert!(session(h.state()).vault.opened_with_backup);
+        assert!(h.query_by_label("Current master password").is_none());
+
+        type_into(&mut h, "New master password", "Brand-New-Master-1");
+        type_into(&mut h, "Type the new password again", "Brand-New-Master-1");
+        click(&mut h, "Change master password");
+        wait(&mut h, "master reset", |a| a.s.busy.is_none() && !session(a).vault.opened_with_backup);
+        assert!(UnlockedVault::unlock_with_password(&path, "Brand-New-Master-1").is_ok());
+        assert!(UnlockedVault::unlock_with_password(&path, TEST_PASSWORD).is_err());
     }
 
     /// Screenshots of every view from the demo vault, without saving anything.

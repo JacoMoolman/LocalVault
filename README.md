@@ -25,7 +25,9 @@ A password vault for Windows 10 and 11 that keeps everything on your own PC. No 
 
 The vault is saved as `LocalVault.vault` next to the exe, with the previous version kept as `LocalVault.bak`. Back up by copying the `.vault` file; the copy stays encrypted.
 
-**There is no password reset.** If you forget the master password and have no working Windows Hello on that PC, the vault cannot be opened.
+**Add a backup password in Settings.** If you forget the master password, type the backup password on the lock screen and choose a new master password. It is sealed the same way as the master password and never stored in the code. Each vault has its own, and anyone who knows it can open that vault.
+
+**There is no other reset.** If you forget the master password, have no backup password and have no working Windows Hello on that PC, the vault cannot be opened.
 
 ## How the encryption works
 

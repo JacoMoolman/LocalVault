@@ -2,11 +2,12 @@
 //!
 //! Layout (envelope encryption):
 //!   * A random 256-bit vault key encrypts the entries.
-//!   * The vault key is stored twice, each copy sealed by a different "slot":
+//!   * The vault key is stored several times, each copy sealed by a different "slot":
 //!       - password slot: key derived from the master password with Argon2id
+//!       - backup slot (optional): the same, from a separate backup password
 //!       - Windows Hello slot (optional): key derived from a signature made by a
 //!         TPM-backed Windows Hello key that never leaves this PC
-//!   * Nothing in the file is readable without one of those two secrets.
+//!   * Nothing in the file is readable without one of those secrets.
 
 use std::fs;
 use std::io::Write;
@@ -20,6 +21,7 @@ use crate::crypto::{self, CryptoError, KdfParams, SALT_LEN, Sealed, SecretKey, b
 const FORMAT_NAME: &str = "LocalVault";
 const FORMAT_VERSION: u32 = 1;
 const AAD_PASSWORD_SLOT: &[u8] = b"LocalVault v1 password slot";
+const AAD_BACKUP_SLOT: &[u8] = b"LocalVault v1 backup slot";
 const AAD_HELLO_SLOT: &[u8] = b"LocalVault v1 windows hello slot";
 const AAD_DATA: &[u8] = b"LocalVault v1 data";
 const HELLO_KEY_LABEL: &[u8] = b"LocalVault v1 windows hello key";
@@ -38,7 +40,7 @@ impl std::fmt::Display for VaultError {
         match self {
             VaultError::Io(e) => write!(f, "Could not read or write the vault file: {e}"),
             VaultError::Format(e) => write!(f, "The vault file is damaged or not a LocalVault file ({e})."),
-            VaultError::WrongPassword => write!(f, "That master password is not correct."),
+            VaultError::WrongPassword => write!(f, "That password is not correct."),
             VaultError::HelloKeyMismatch => {
                 write!(f, "Windows Hello could not open this vault. Unlock with your master password and set up Windows Hello again in Settings.")
             }
@@ -88,6 +90,9 @@ pub struct VaultFile {
     #[serde(with = "b64")]
     pub vault_id: Vec<u8>,
     pub password_slot: PasswordSlot,
+    /// Absent in vaults created before backup passwords existed.
+    #[serde(default)]
+    pub backup_slot: Option<PasswordSlot>,
     pub hello_slot: Option<HelloSlot>,
     pub data: Sealed,
 }
@@ -199,6 +204,9 @@ pub struct UnlockedVault {
     file: VaultFile,
     key: SecretKey,
     pub data: VaultData,
+    /// True when this session was opened with the backup password, so the
+    /// master password can be replaced without knowing the old one.
+    pub opened_with_backup: bool,
 }
 
 fn make_password_slot(file_aad: &[u8], key: &SecretKey, password: &str, kdf: KdfParams) -> Result<PasswordSlot, VaultError> {
@@ -219,11 +227,12 @@ impl UnlockedVault {
             version: FORMAT_VERSION,
             vault_id,
             password_slot: PasswordSlot { kdf, salt: Vec::new(), wrapped_key: placeholder.clone() },
+            backup_slot: None,
             hello_slot: None,
             data: placeholder,
         };
         file.password_slot = make_password_slot(&file.aad(AAD_PASSWORD_SLOT), &key, password, kdf)?;
-        let mut vault = UnlockedVault { path: path.to_path_buf(), file, key, data: VaultData::default() };
+        let mut vault = UnlockedVault { path: path.to_path_buf(), file, key, data: VaultData::default(), opened_with_backup: false };
         vault.save()?;
         Ok(vault)
     }
@@ -232,8 +241,15 @@ impl UnlockedVault {
         let file = VaultFile::load(path)?;
         let slot = &file.password_slot;
         let kek = crypto::derive_key(password.as_bytes(), &slot.salt, slot.kdf)?;
-        let key = crypto::unwrap_key(&kek, &slot.wrapped_key, &file.aad(AAD_PASSWORD_SLOT)).map_err(|_| VaultError::WrongPassword)?;
-        Self::open_with_key(path, file, key)
+        if let Ok(key) = crypto::unwrap_key(&kek, &slot.wrapped_key, &file.aad(AAD_PASSWORD_SLOT)) {
+            return Self::open_with_key(path, file, key);
+        }
+        let slot = file.backup_slot.as_ref().ok_or(VaultError::WrongPassword)?;
+        let kek = crypto::derive_key(password.as_bytes(), &slot.salt, slot.kdf)?;
+        let key = crypto::unwrap_key(&kek, &slot.wrapped_key, &file.aad(AAD_BACKUP_SLOT)).map_err(|_| VaultError::WrongPassword)?;
+        let mut vault = Self::open_with_key(path, file, key)?;
+        vault.opened_with_backup = true;
+        Ok(vault)
     }
 
     /// `signature` is what Windows Hello returned for the slot's challenge.
@@ -247,7 +263,7 @@ impl UnlockedVault {
     fn open_with_key(path: &Path, file: VaultFile, key: SecretKey) -> Result<UnlockedVault, VaultError> {
         let plain = crypto::open(&key, &file.data, &file.aad(AAD_DATA)).map_err(|_| VaultError::Format("vault data failed authentication".into()))?;
         let data: VaultData = serde_json::from_slice(&plain).map_err(|e| VaultError::Format(e.to_string()))?;
-        Ok(UnlockedVault { path: path.to_path_buf(), file, key, data })
+        Ok(UnlockedVault { path: path.to_path_buf(), file, key, data, opened_with_backup: false })
     }
 
     pub fn save(&mut self) -> Result<(), VaultError> {
@@ -289,7 +305,24 @@ impl UnlockedVault {
     pub fn set_password_key(&mut self, salt: Vec<u8>, kdf: KdfParams, kek: &SecretKey) -> Result<(), VaultError> {
         let wrapped_key = crypto::wrap_key(kek, &self.key, &self.file.aad(AAD_PASSWORD_SLOT))?;
         self.file.password_slot = PasswordSlot { kdf, salt, wrapped_key };
+        self.opened_with_backup = false;
         self.save()
+    }
+
+    /// Installs or replaces the backup slot from a key derived (elsewhere) with `salt` and `kdf`.
+    pub fn set_backup_key(&mut self, salt: Vec<u8>, kdf: KdfParams, kek: &SecretKey) -> Result<(), VaultError> {
+        let wrapped_key = crypto::wrap_key(kek, &self.key, &self.file.aad(AAD_BACKUP_SLOT))?;
+        self.file.backup_slot = Some(PasswordSlot { kdf, salt, wrapped_key });
+        self.save()
+    }
+
+    pub fn remove_backup(&mut self) -> Result<(), VaultError> {
+        self.file.backup_slot = None;
+        self.save()
+    }
+
+    pub fn has_backup(&self) -> bool {
+        self.file.backup_slot.is_some()
     }
 
     pub fn path(&self) -> &Path {
@@ -442,6 +475,59 @@ mod tests {
         v.set_password_key(new_salt, KdfParams::TEST, &kek).unwrap();
         assert!(UnlockedVault::unlock_with_password(&path, "new").is_ok());
         assert!(UnlockedVault::unlock_with_password(&path, "old").is_err());
+    }
+
+    fn add_backup(v: &mut UnlockedVault, password: &[u8]) {
+        let salt = crypto::random_bytes::<SALT_LEN>().unwrap().to_vec();
+        let kek = crypto::derive_key(password, &salt, KdfParams::TEST).unwrap();
+        v.set_backup_key(salt, KdfParams::TEST, &kek).unwrap();
+    }
+
+    #[test]
+    fn backup_password_opens_and_resets_master() {
+        let (_d, path) = temp_vault();
+        let mut v = UnlockedVault::create(&path, "master", KdfParams::TEST).unwrap();
+        v.data.entries.push(sample_entry("Mail", "m"));
+        add_backup(&mut v, b"backup");
+
+        assert!(!UnlockedVault::unlock_with_password(&path, "master").unwrap().opened_with_backup);
+        assert!(matches!(UnlockedVault::unlock_with_password(&path, "wrong"), Err(VaultError::WrongPassword)));
+
+        let mut v = UnlockedVault::unlock_with_password(&path, "backup").unwrap();
+        assert!(v.opened_with_backup);
+        assert_eq!(v.data.entries[0].title, "Mail");
+
+        // The unused current password may be empty when resetting.
+        let (salt, kdf) = v.password_kdf_inputs();
+        crypto::derive_key(b"", &salt, kdf).unwrap();
+        let new_salt = crypto::random_bytes::<SALT_LEN>().unwrap().to_vec();
+        let kek = crypto::derive_key(b"new master", &new_salt, KdfParams::TEST).unwrap();
+        v.set_password_key(new_salt, KdfParams::TEST, &kek).unwrap();
+        assert!(!v.opened_with_backup);
+
+        assert!(UnlockedVault::unlock_with_password(&path, "master").is_err());
+        assert!(UnlockedVault::unlock_with_password(&path, "new master").is_ok());
+        assert!(UnlockedVault::unlock_with_password(&path, "backup").is_ok());
+    }
+
+    #[test]
+    fn removed_backup_stops_working() {
+        let (_d, path) = temp_vault();
+        let mut v = UnlockedVault::create(&path, "master", KdfParams::TEST).unwrap();
+        add_backup(&mut v, b"backup");
+        v.remove_backup().unwrap();
+        assert!(!v.has_backup());
+        assert!(matches!(UnlockedVault::unlock_with_password(&path, "backup"), Err(VaultError::WrongPassword)));
+    }
+
+    #[test]
+    fn older_vault_without_backup_slot_still_opens() {
+        let (_d, path) = temp_vault();
+        UnlockedVault::create(&path, "master", KdfParams::TEST).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("backup_slot");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(UnlockedVault::unlock_with_password(&path, "master").is_ok());
     }
 
     #[test]
