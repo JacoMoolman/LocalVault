@@ -99,6 +99,10 @@ pub struct VaultFile {
 
 impl VaultFile {
     pub fn load(path: &Path) -> Result<VaultFile, VaultError> {
+        Self::read(path).or_else(|e| Self::read(&path.with_extension("bak")).map_err(|_| e))
+    }
+
+    fn read(path: &Path) -> Result<VaultFile, VaultError> {
         let bytes = fs::read(path)?;
         let file: VaultFile = serde_json::from_slice(&bytes).map_err(|e| VaultError::Format(e.to_string()))?;
         if file.format != FORMAT_NAME {
@@ -121,21 +125,19 @@ impl VaultFile {
     }
 }
 
-/// Writes to a temporary file first, then swaps it in, so a crash or power
-/// cut never leaves a half-written vault. The previous version is kept as
-/// `<name>.bak` (it is just as encrypted as the vault itself).
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    if path.exists() {
-        fs::copy(path, path.with_extension("bak"))?;
-    }
-    fs::rename(&tmp, path)?;
+fn write_file(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    let mut f = fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
+}
+
+/// Writes `<name>.bak` in full, then the vault itself, so a crash or power cut
+/// always leaves one complete copy for `load` to find. No renames or file
+/// swaps: antivirus software treats those as ransomware behaviour.
+fn write_safely(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    write_file(&path.with_extension("bak"), bytes)?;
+    write_file(path, bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +272,7 @@ impl UnlockedVault {
         let plain = Zeroizing::new(serde_json::to_vec(&self.data).map_err(|e| VaultError::Format(e.to_string()))?);
         self.file.data = crypto::seal(&self.key, &plain, &self.file.aad(AAD_DATA))?;
         let bytes = serde_json::to_vec_pretty(&self.file).map_err(|e| VaultError::Format(e.to_string()))?;
-        write_atomically(&self.path, &bytes)
+        write_safely(&self.path, &bytes)
     }
 
     #[cfg(test)]
